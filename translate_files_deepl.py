@@ -1,52 +1,85 @@
+"""
+Translate the text files made by Extraction.py (option 1) with DeepL.
+
+Only text lines are sent; the "###" marker lines that gsspt needs to rebuild
+the .spt file are copied unchanged. The previous lines are sent as DeepL
+`context`, which improves pronouns and tone.
+
+Usage:
+    export DEEPL_API_KEY=xxxxxxxx:fx
+    python translate_files_deepl.py scripts_repaired/ scripts_translated/ [--lang EN-US]
+
+Note: for new projects, VNTools (https://github.com/abunomaru/VNTools) reads
+.spt files directly, translates with speaker-aware context (Claude, OpenAI,
+local models or DeepL) and re-inserts text of any length.
+"""
+
+import argparse
+import json
 import os
-import requests
+import sys
+import time
+import urllib.error
+import urllib.request
 
-def translate_file(input_file, output_file):
-    # Read the content of the input file
-    with open(input_file, "r", encoding="utf-8") as file:
-        text = file.read()
+BATCH = 50
 
-    # Set parameters for the DeepL API request
-    params = {
-        # Your authentication key goes here
-        "auth_key": "",
-        "text": text,
-        "target_lang": "EN-US"
-    }
 
-    # Make a POST request to the DeepL API
-    response = requests.post("https://api-free.deepl.com/v2/translate", data=params)
+def deepl_translate(texts, api_key, target_lang, context=''):
+    host = 'api-free.deepl.com' if api_key.endswith(':fx') else 'api.deepl.com'
+    body = {'text': texts, 'source_lang': 'JA', 'target_lang': target_lang,
+            'preserve_formatting': True}
+    if context:
+        body['context'] = context
+    req = urllib.request.Request(
+        f'https://{host}/v2/translate', data=json.dumps(body).encode('utf-8'),
+        headers={'Authorization': f'DeepL-Auth-Key {api_key}',
+                 'Content-Type': 'application/json'},
+        method='POST')
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return [t['text'] for t in json.loads(resp.read())['translations']]
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < 5:
+                time.sleep(2 ** attempt)
+                continue
+            raise RuntimeError(f'DeepL error {e.code}: {e.read().decode("utf-8", "replace")}')
 
-    # Check if the request was successful
-    if response.status_code == 200:
-        # Extract translated text from the JSON response
-        translated_text = response.json()["translations"][0]["text"]
 
-        # Write the translated text to the output file
-        with open(output_file, "w", encoding="utf-8") as file:
-            file.write(translated_text)
-    else:
-        print("Error translating file:", response.text)
+def translate_file(input_file, output_file, api_key, target_lang):
+    with open(input_file, 'r', encoding='utf-8') as f:
+        lines = f.read().split('\n')
 
-def translate_files(input_dir, output_dir):
-    # Ensure that the output directory exists
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    todo = [i for i, line in enumerate(lines) if line.strip() and not line.startswith('###')]
+    out = list(lines)
+    for start in range(0, len(todo), BATCH):
+        idx = todo[start:start + BATCH]
+        context = '\n'.join(lines[i] for i in todo[max(0, start - 5):start])
+        for i, text in zip(idx, deepl_translate([lines[i] for i in idx], api_key, target_lang, context)):
+            out[i] = text
 
-    # Translate each file in the input directory
-    for filename in os.listdir(input_dir):
-        if filename.endswith(".txt"):
-            input_file = os.path.join(input_dir, filename)
-            output_file = os.path.join(output_dir, filename)
-            translate_file(input_file, output_file)
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(out))
+    print(f'{os.path.basename(input_file)}: {len(todo)} lines')
 
-if __name__ == "__main__":
-    # Directory where the untranslated .txt files are located
-    input_dir = "/path/to/untranslated/files/"
-    
-    # Directory where the translated files will be saved
-    # Ensure that this directory exists and has appropriate permissions
-    output_dir = "/path/to/save/translated/files/"
-    
-    translate_files(input_dir, output_dir)
 
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('input_dir')
+    ap.add_argument('output_dir')
+    ap.add_argument('--lang', default='EN-US', help='DeepL target language code (default EN-US)')
+    ap.add_argument('--api-key', default=os.environ.get('DEEPL_API_KEY', ''))
+    args = ap.parse_args()
+    if not args.api_key:
+        sys.exit('Set DEEPL_API_KEY or pass --api-key')
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    for name in sorted(os.listdir(args.input_dir)):
+        if name.endswith('.txt'):
+            translate_file(os.path.join(args.input_dir, name), os.path.join(args.output_dir, name),
+                           args.api_key, args.lang)
+
+
+if __name__ == '__main__':
+    main()
